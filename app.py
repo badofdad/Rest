@@ -108,6 +108,20 @@ def status():
             "return_code": bgmi_process.poll() if bgmi_process else None
         })
 
+@app.route('/logs', methods=['GET'])
+def get_logs():
+    global bgmi_process
+    if not bgmi_process:
+        return jsonify({"error": "No process running"}), 404
+
+    stdout, stderr = bgmi_process.communicate(timeout=1)  # 1-second timeout
+    return jsonify({
+        "stdout": stdout,
+        "stderr": stderr,
+        "return_code": bgmi_process.returncode
+    })
+
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     print(f"Starting server on port {port}")
