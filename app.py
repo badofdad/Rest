@@ -25,7 +25,7 @@ stop_event = threading.Event()
 def run_bgmi_server(ip, port, duration, threads):
     global bgmi_process
     try:
-        command = f"./danger {ip} {port} {duration} {threads}"
+        command = f"./bgmi {ip} {port} {duration} {threads}"
         logger.info(f"Starting BGMI server with command: {command}")
 
         # Modified to show output in real-time

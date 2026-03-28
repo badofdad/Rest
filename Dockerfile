@@ -7,7 +7,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-RUN chmod +x danger
+RUN chmod +x bgmi
 
 ENV PORT=5000
 
