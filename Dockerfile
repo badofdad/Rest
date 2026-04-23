@@ -1,19 +1,17 @@
-FROM python:3.9-slim
+FROM python:3.11-slim
 
 WORKDIR /app
 
+# Install dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . .
-
+# Copy your bgmi binary
+COPY bgmi .
 RUN chmod +x bgmi
 
-ENV PORT=5000
+# Copy the app
+COPY app.py .
 
-# Add this to ensure logs are captured
-ENV PYTHONUNBUFFERED=1
-
-EXPOSE $PORT
-
-CMD ["sh", "-c", "gunicorn --bind 0.0.0.0:${PORT} --access-logfile - --error-logfile - app:app"]
+# Run the app
+CMD
